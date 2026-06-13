@@ -46,11 +46,14 @@ export class TestStorageBackend implements StorageBackend {
         this.store[key] = value;
     }
 
+    /**
+     * Fixed: the original implementation wrapped the push in setTimeout, causing the mutation
+     * to happen after the promise resolved. The async function now performs the push synchronously
+     * within the same microtask, so awaiting rPush correctly reflects the updated list.
+     */
     async rPush(key: string, value: StoredValue): Promise<void> {
-        setTimeout(() => {
-            const existingList = this.listStore[key] || [];
-            this.listStore[key] = [...existingList, value];
-        }, 0);
+        const existingList = this.listStore[key] || [];
+        this.listStore[key] = [...existingList, value];
     }
 
     async keys(pattern: string): Promise<string[]> {
