@@ -4,6 +4,7 @@ import { inject, injectable } from 'tsyringe';
 
 import { StorageBackend } from './storage-backend/storage-backend';
 import { StorageBackendToken } from '../ioc-tokens';
+import { computeChecksum } from './helpers';
 
 export interface FileStorage {
     /**
@@ -37,24 +38,137 @@ export interface FileStorage {
     listUploadedFiles(): Promise<string[]>;
 }
 
+
+/**
+ * Key schema:
+ *   {fileName}:chunk:{index}       — Buffer containing the raw bytes of that chunk
+ *   {fileName}:checksum:{index}    — hex SHA-1 of that chunk (integrity verification on download)
+ *   {fileName}:meta:chunkCount     — string containing total number of chunks
+ */
+function chunkKey(fileName: string, index: number): string {
+    return `${fileName}:chunk:${index}`;
+}
+
+function checksumKey(fileName: string, index: number): string {
+    return `${fileName}:checksum:${index}`;
+}
+
+function metaChunkCountKey(fileName: string): string {
+    return `${fileName}:meta:chunkCount`;
+}
+
+/**
+ * Collect a ReadableStream<Uint8Array> or Node ReadStream into fixed-size byte chunks.
+ * Each yielded chunk is exactly `chunkSize` bytes, except possibly the last one.
+ */
+async function* toChunks(
+    stream: ReadableStream<Uint8Array> | ReadStream,
+    chunkSize: number
+): AsyncGenerator<Buffer> {
+    let accumulated = Buffer.alloc(0);
+
+    // Normalise to an async iterable
+    const iterable: AsyncIterable<Uint8Array> =
+        Symbol.asyncIterator in stream
+            ? (stream as AsyncIterable<Uint8Array>)
+            : (stream as ReadableStream<Uint8Array>)[Symbol.asyncIterator]
+                ? (stream as AsyncIterable<Uint8Array>)
+                : streamToAsyncIterable(stream as ReadableStream<Uint8Array>);
+
+    for await (const incoming of iterable) {
+        accumulated = Buffer.concat([accumulated, Buffer.from(incoming)]);
+
+        while (accumulated.length >= chunkSize) {
+            yield accumulated.subarray(0, chunkSize);
+            accumulated = accumulated.subarray(chunkSize);
+        }
+    }
+
+    if (accumulated.length > 0) {
+        yield accumulated;
+    }
+}
+
+/**
+ * Adapt a Web Streams ReadableStream to an AsyncIterable so we can use `for await`.
+ */
+async function* streamToAsyncIterable(
+    stream: ReadableStream<Uint8Array>
+): AsyncGenerator<Uint8Array> {
+    const reader = stream.getReader();
+    try {
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            yield value;
+        }
+    } finally {
+        reader.releaseLock();
+    }
+}
+
 @injectable()
 export class AppFileStorage implements FileStorage {
     constructor(@inject(StorageBackendToken) private backend: StorageBackend) {
         console.log('TODO: implement AppFileStorage', this.backend);
     }
 
+    /**
+        * Splits `fileStream` into `chunkSize`-byte chunks, persists each chunk together with its
+        * SHA-1 checksum, and writes a metadata entry that records how many chunks make up the file.
+        *
+        * The `parallel` parameter (bonus feature) controls the concurrency of the backend `set` calls
+        * made per batch of chunks. Sequential upload is used when parallel is 1 (or omitted).
+        */
     public async uploadFile(
-        _fileStream: ReadableStream<Uint8Array> | ReadStream,
-        _fileName: string,
-        _chunkSize: number,
-        _parallel: number
-    ): Promise<void> {}
+        fileStream: ReadableStream<Uint8Array> | ReadStream,
+        fileName: string,
+        chunkSize: number,
+        parallel: number = 1
+    ): Promise<void> {
+        let chunkIndex = 0;
+        const pendingWrites: Promise<void>[] = [];
+
+        const flushWrites = async (writes: Promise<void>[]): Promise<void> => {
+            await Promise.all(writes);
+        };
+
+        for await (const chunk of toChunks(fileStream, chunkSize)) {
+            const index = chunkIndex++;
+            const checksum = computeChecksum(chunk);
+
+            const writeChunk = async (): Promise<void> => {
+                await this.backend.set(chunkKey(fileName, index), chunk);
+                await this.backend.set(checksumKey(fileName, index), checksum);
+            };
+
+            pendingWrites.push(writeChunk());
+
+            // Flush in batches of `parallel` to honour the concurrency limit
+            if (pendingWrites.length >= parallel) {
+                await flushWrites(pendingWrites.splice(0, parallel));
+            }
+        }
+
+        // Flush any remaining writes
+        if (pendingWrites.length > 0) {
+            await flushWrites(pendingWrites);
+        }
+
+        // Record total chunk count so download can reconstruct without a KEYS scan
+        await this.backend.set(metaChunkCountKey(fileName), String(chunkIndex));
+    }
 
     public async downloadFile(fileName: string, _parallel: number): Promise<Buffer> {
         throw new Error(`File ${fileName} not found`);
     }
 
+    /**
+     * Lists file names that have been uploaded. Uses the metadata key pattern so each file
+     * appears exactly once (one meta entry per file), regardless of how many chunks it has.
+     */
     public async listUploadedFiles(): Promise<string[]> {
-        return [];
+        const metaKeys = await this.backend.keys('*:meta:chunkCount');
+        return metaKeys.map((key) => key.replace(':meta:chunkCount', ''));
     }
 }
