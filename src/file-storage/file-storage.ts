@@ -159,10 +159,66 @@ export class AppFileStorage implements FileStorage {
         await this.backend.set(metaChunkCountKey(fileName), String(chunkIndex));
     }
 
-    public async downloadFile(fileName: string, _parallel: number): Promise<Buffer> {
-        throw new Error(`File ${fileName} not found`);
-    }
+    /**
+     * Reassembles the file from its stored chunks in order, verifying each chunk's SHA-1
+     * checksum before including it in the output. Throws if the file is not found or if any
+     * chunk fails its integrity check.
+     *
+     * The `parallel` parameter (bonus feature) controls the concurrency of the backend `getBuffer`
+     * calls used to fetch chunks.
+     */
+    public async downloadFile(fileName: string, parallel: number = 1): Promise<Buffer> {
+        const chunkCountStr = await this.backend.get(metaChunkCountKey(fileName));
+        if (chunkCountStr === null) {
+            throw new Error(`File ${fileName} not found`);
+        }
 
+        const chunkCount = parseInt(chunkCountStr, 10);
+        const chunks: Buffer[] = new Array<Buffer>(chunkCount);
+
+        // Fetch chunks in parallel batches
+        for (let batchStart = 0; batchStart < chunkCount; batchStart += parallel) {
+            const batchEnd = Math.min(batchStart + parallel, chunkCount);
+            const batchIndices = Array.from(
+                { length: batchEnd - batchStart },
+                (_, i) => batchStart + i
+            );
+
+            const fetchedChunks = await Promise.all(
+                batchIndices.map(async (index) => {
+                    const [chunk, expectedChecksum] = await Promise.all([
+                        this.backend.getBuffer(chunkKey(fileName, index)),
+                        this.backend.get(checksumKey(fileName, index)),
+                    ]);
+
+                    if (chunk === null) {
+                        throw new Error(`File ${fileName} not found: missing chunk ${index}`);
+                    }
+
+                    if (expectedChecksum === null) {
+                        throw new Error(
+                            `File ${fileName} not found: missing checksum for chunk ${index}`
+                        );
+                    }
+
+                    const actualChecksum = computeChecksum(chunk);
+                    if (actualChecksum !== expectedChecksum) {
+                        throw new Error(
+                            `File ${fileName} is corrupted: checksum mismatch on chunk ${index}`
+                        );
+                    }
+
+                    return { index, chunk };
+                })
+            );
+
+            for (const { index, chunk } of fetchedChunks) {
+                chunks[index] = chunk;
+            }
+        }
+
+        return Buffer.concat(chunks);
+    }
     /**
      * Lists file names that have been uploaded. Uses the metadata key pattern so each file
      * appears exactly once (one meta entry per file), regardless of how many chunks it has.
